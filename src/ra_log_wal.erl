@@ -126,7 +126,13 @@
                 % and the last index seen
                 writers = #{} :: #{ra_uid() =>
                                    {in_seq | out_of_seq, ra_index()}},
-                batch :: option(#batch{})
+                batch :: option(#batch{}),
+                %% --- async fdatasync fields ---
+                %% List of {Waiting, WalRanges} tuples queued for writer
+                %% notification after the next fdatasync completes.
+                pending_sync = [] :: [{map(), map()}],
+                %% True when a spawned process is currently running fdatasync.
+                sync_in_flight = false :: boolean()
                }).
 
 -type state() :: #state{}.
@@ -365,6 +371,8 @@ format_status(#state{conf = #conf{sync_method = SyncMeth,
                                   names = #{wal := WalName},
                                   max_size_bytes = MaxSize},
                      writers = Writers,
+                     pending_sync = PendingSync,
+                     sync_in_flight = SyncInFlight,
                      wal = #wal{file_size = FSize,
                                 filename = Fn}}) ->
     #{sync_method => SyncMeth,
@@ -373,7 +381,9 @@ format_status(#state{conf = #conf{sync_method = SyncMeth,
       filename => filename:basename(Fn),
       current_size => FSize,
       max_size_bytes => MaxSize,
-      counters => ra_counters:overview(WalName)
+      counters => ra_counters:overview(WalName),
+      async_sync => #{pending_batches => length(PendingSync),
+                      sync_in_flight => SyncInFlight}
      }.
 
 %% Internal
@@ -384,8 +394,23 @@ handle_op({call, From, {last_writer_seq, UId}},
            {#state{writers = Writers} = State, Actions}) ->
     {_, Res} = maps:get(UId, Writers, {undefined, undefined}),
     {State, [{reply, From, Res} | Actions]};
+%% async fdatasync completion handler
+handle_op({info, {wal_async_sync_complete}},
+          {#state{pending_sync = _PendingSync} = State0, Actions}) ->
+    State1 = State0#state{sync_in_flight = false},
+    %% Notify all writers queued since the last sync.
+    State2 = notify_all_pending(State1),
+    %% If more entries arrived during the sync, start another sync cycle.
+    State3 = case State2#state.pending_sync of
+                 [] -> State2;
+                 _ -> maybe_start_async_sync(State2)
+             end,
+    {State3, Actions};
+handle_op({info, {'EXIT', _, normal}}, {State, Actions}) ->
+    %% Normal exit from spawned async sync process — expected, ignore.
+    {State, Actions};
 handle_op({info, {'EXIT', _, Reason}}, _State) ->
-    %% this is here for testing purposes only
+    %% Abnormal exit — crash the WAL
     throw({stop, Reason}).
 
 recover_wal(Dir, #conf{system = System,
@@ -632,8 +657,48 @@ incr_batch(#batch{num_writes = Writes,
                 pending = [Pend | Data]}.
 
 complete_batch_and_roll(#state{} = State0) ->
-    State = complete_batch(State0),
-    roll_over(start_batch(State)).
+    State1 = complete_batch(State0),
+    %% Before rolling over, synchronously drain any in-flight async sync
+    %% and notify all pending writers. The old Fd is about to be closed.
+    State2 = drain_pending_sync(State1),
+    roll_over(start_batch(State2)).
+
+%% Synchronously drain any pending async sync. Called before WAL rollover
+%% and during terminate to ensure all writers are notified.
+drain_pending_sync(#state{pending_sync = [],
+                          sync_in_flight = false} = State) ->
+    State;
+drain_pending_sync(#state{wal = #wal{fd = Fd},
+                          conf = #conf{sync_method = SyncMeth},
+                          sync_in_flight = true,
+                          pending_sync = Pending} = State) when Pending =/= [] ->
+    %% A sync is in flight AND we have pending writers. Wait for the in-flight
+    %% sync to complete, then do our own sync to cover any data written after
+    %% the in-flight sync started, and finally notify all pending writers.
+    receive
+        {wal_async_sync_complete} -> ok
+    after 30000 -> ok
+    end,
+    sync(Fd, SyncMeth),
+    State1 = State#state{sync_in_flight = false},
+    notify_all_pending(State1);
+drain_pending_sync(#state{wal = #wal{fd = Fd},
+                          conf = #conf{sync_method = SyncMeth},
+                          sync_in_flight = false,
+                          pending_sync = Pending} = State) when Pending =/= [] ->
+    %% No sync in flight but pending writers. Sync and notify.
+    sync(Fd, SyncMeth),
+    notify_all_pending(State#state{sync_in_flight = false});
+drain_pending_sync(#state{sync_in_flight = true,
+                          wal = #wal{fd = Fd},
+                          conf = #conf{sync_method = SyncMeth}} = State) ->
+    %% sync in flight but no pending writers — wait for completion
+    receive
+        {wal_async_sync_complete} -> ok
+    after 30000 -> ok
+    end,
+    sync(Fd, SyncMeth),
+    State#state{sync_in_flight = false}.
 
 roll_over(#state{wal = Wal0, file_num = Num0,
                  writers = Writers,
@@ -768,11 +833,13 @@ start_batch(#state{conf = #conf{counter = CRef}} = State) ->
     ok = counters:add(CRef, ?C_BATCHES, 1),
     State#state{batch = #batch{}}.
 
+%% flush_pending writes data to kernel buffer but does NOT call sync.
+%% The sync is done asynchronously by maybe_start_async_sync/1.
 flush_pending(#state{wal = #wal{fd = Fd},
                      batch = #batch{pending = Pend},
-                     conf = #conf{sync_method = SyncMeth}} = State0) ->
+                     conf = #conf{}} = State0) ->
     ok = file:write(Fd, Pend),
-    sync(Fd, SyncMeth),
+    %% NO sync here — it's done asynchronously
     State0#state{batch = undefined}.
 
 sync(_Fd, none) ->
@@ -786,17 +853,59 @@ complete_batch(#state{batch = undefined} = State) ->
 complete_batch(#state{batch = #batch{waiting = Waiting,
                                      num_writes = NumWrites},
                       wal = Wal,
-                      conf = Cfg} = State0) ->
-    % TS = erlang:system_time(microsecond),
+                      conf = Cfg,
+                      pending_sync = PendingSync} = State0) ->
+    %% Write data synchronously, queue writers for async notification.
     State = flush_pending(State0),
-    % SyncTS = erlang:system_time(microsecond),
     counters:add(Cfg#conf.counter, ?C_WRITES, NumWrites),
 
-    %% process writers
-    Ranges = maps:fold(fun (Pid, BatchWriter, Acc) ->
-                               complete_batch_writer(Pid, BatchWriter, Acc)
-                       end, Wal#wal.ranges, Waiting),
-    State#state{wal = Wal#wal{ranges = Ranges}}.
+    %% DON'T notify writers yet — queue them for after the next fdatasync.
+    NewPending = [{Waiting, Wal#wal.ranges} | PendingSync],
+
+    %% Try to start an async sync if not already running.
+    maybe_start_async_sync(State#state{pending_sync = NewPending}).
+
+%% Start an asynchronous fdatasync if none is in flight.
+maybe_start_async_sync(#state{sync_in_flight = true} = State) ->
+    %% Already syncing — new entries will be covered by the next sync cycle.
+    State;
+maybe_start_async_sync(#state{pending_sync = []} = State) ->
+    %% Nothing to sync.
+    State;
+maybe_start_async_sync(#state{conf = #conf{sync_method = none}} = State) ->
+    %% sync_method = none: no sync needed, notify immediately.
+    notify_all_pending(State);
+maybe_start_async_sync(#state{wal = #wal{filename = Filename},
+                               conf = #conf{sync_method = SyncMeth}} = State) ->
+    Self = self(),
+    %% spawn_link: if fdatasync crashes, the WAL crashes too.
+    %% We open a SEPARATE fd to the same file because files opened with
+    %% [raw] mode tie the prim_file fd to the opening process.
+    spawn_link(fun() ->
+        {ok, SyncFd} = file:open(Filename, [raw, write, binary]),
+        ok = file:SyncMeth(SyncFd),
+        ok = file:close(SyncFd),
+        Self ! {wal_async_sync_complete}
+    end),
+    State#state{sync_in_flight = true}.
+
+%% Notify all writers queued in pending_sync.
+%% Called after fdatasync completes (or immediately for sync_method=none).
+notify_all_pending(#state{pending_sync = []} = State) ->
+    State;
+notify_all_pending(#state{pending_sync = PendingBatches,
+                          wal = Wal} = State) ->
+    %% Process all queued batches in order (oldest first — reverse since
+    %% we prepend newest).
+    FinalRanges = lists:foldl(
+        fun({Waiting, _BatchRanges}, AccRanges) ->
+            maps:fold(fun(Pid, BatchWriter, Acc) ->
+                complete_batch_writer(Pid, BatchWriter, Acc)
+            end, AccRanges, Waiting)
+        end, Wal#wal.ranges, lists:reverse(PendingBatches)),
+
+    State#state{pending_sync = [],
+                wal = Wal#wal{ranges = FinalRanges}}.
 
 complete_batch_writer(Pid, #batch_writer{smallest_live_idx = SmallestIdx,
                                          tid = MtTid,

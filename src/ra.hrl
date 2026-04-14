@@ -211,7 +211,7 @@
 
 %% WAL defaults
 -define(WAL_DEFAULT_MAX_SIZE_BYTES, 256 * 1000 * 1000).
--define(WAL_DEFAULT_MAX_BATCH_SIZE, 8192).
+-define(WAL_DEFAULT_MAX_BATCH_SIZE, 32768).
 -define(MIN_BIN_VHEAP_SIZE, 46422).
 -define(MIN_HEAP_SIZE, 233).
 %% define a minimum allowable wal size. If anyone tries to set a really small

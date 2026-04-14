@@ -4,12 +4,12 @@
 %%
 %% Copyright (c) 2017-2025 Broadcom. All Rights Reserved. The term Broadcom refers to Broadcom Inc. and/or its subsidiaries.
 %%
--define(AER_CHUNK_SIZE, 128).
+-define(AER_CHUNK_SIZE, 512).
 -define(DEFAULT_MAX_PIPELINE_COUNT, 4096).
 -define(DEFAULT_SNAPSHOT_CHUNK_SIZE, 1000000). % 1MB
 -define(DEFAULT_RECEIVE_SNAPSHOT_TIMEOUT, 30000).
 -define(DEFAULT_MACHINE_UPGRADE_STRATEGY, all).
--define(FLUSH_COMMANDS_SIZE, 16).
+-define(FLUSH_COMMANDS_SIZE, 128).
 
 -record(cfg,
         {id :: ra_server_id(),
