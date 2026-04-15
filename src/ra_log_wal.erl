@@ -779,6 +779,8 @@ open_wal(File, Max, #conf{wal_io_module = IoMod} = Conf0) ->
             CommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 200),
             MaxBufBytes = maps:get(wal_max_buffer_bytes, Conf0, 64 * 1024 * 1024),
             {ok, Handle} = IoMod:open(File, CommitDelayUs, Max, MaxBufBytes),
+            %% Store handle for stats access from outside
+            persistent_term:put(ferricstore_wal_handle, Handle),
             {Handle, Conf0}
     end,
     {Conf, #wal{fd = Fd,
