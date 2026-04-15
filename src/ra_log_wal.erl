@@ -686,24 +686,27 @@ drain_pending_sync(#state{pending_sync = [],
                           sync_in_flight = false} = State) ->
     State;
 drain_pending_sync(#state{wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth},
+                          conf = #conf{sync_method = SyncMeth,
+                                       wal_io_module = IoMod},
                           sync_in_flight = true,
                           pending_sync = Pending} = State) when Pending =/= [] ->
     wait_for_sync_complete(),
-    sync(Fd, SyncMeth),
+    wal_sync_blocking(IoMod, Fd, SyncMeth),
     State1 = State#state{sync_in_flight = false},
     notify_all_pending(State1);
 drain_pending_sync(#state{wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth},
+                          conf = #conf{sync_method = SyncMeth,
+                                       wal_io_module = IoMod},
                           sync_in_flight = false,
                           pending_sync = Pending} = State) when Pending =/= [] ->
-    sync(Fd, SyncMeth),
+    wal_sync_blocking(IoMod, Fd, SyncMeth),
     notify_all_pending(State#state{sync_in_flight = false});
 drain_pending_sync(#state{sync_in_flight = true,
                           wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth}} = State) ->
+                          conf = #conf{sync_method = SyncMeth,
+                                       wal_io_module = IoMod}} = State) ->
     wait_for_sync_complete(),
-    sync(Fd, SyncMeth),
+    wal_sync_blocking(IoMod, Fd, SyncMeth),
     State#state{sync_in_flight = false}.
 
 %% Wait for either Erlang-spawned or NIF-backed sync completion.
@@ -739,7 +742,7 @@ roll_over(#state{wal = Wal0, file_num = Num0,
                 Half + rand:uniform(Half);
             #wal{ranges = Ranges,
                  filename = Filename} ->
-                _ = file:advise(Wal0#wal.fd, 0, 0, dont_need),
+                _ = try file:advise(Wal0#wal.fd, 0, 0, dont_need) catch _:_ -> ok end,
                 ok = close_file(Wal0#wal.fd),
                 %% floor all sequences
                 MemTables = maps:map(
@@ -763,9 +766,21 @@ roll_over(#state{wal = Wal0, file_num = Num0,
                  wal = Wal,
                  file_num = Num}.
 
-open_wal(File, Max, #conf{} = Conf0) ->
-    {ok, Fd} = prepare_file(File, ?FILE_MODES),
-    Conf = maybe_pre_allocate(Conf0, Fd, Max),
+open_wal(File, Max, #conf{wal_io_module = IoMod} = Conf0) ->
+    {Fd, Conf} = case IoMod of
+        undefined ->
+            {ok, Fd0} = prepare_file(File, ?FILE_MODES),
+            {Fd0, maybe_pre_allocate(Conf0, Fd0, Max)};
+        _Mod ->
+            %% NIF-backed: open via NIF with O_DIRECT + fallocate
+            %% make_tmp writes the header first, then we rename
+            Tmp = make_tmp(File),
+            ok = prim_file:rename(Tmp, File),
+            CommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 200),
+            MaxBufBytes = maps:get(wal_max_buffer_bytes, Conf0, 64 * 1024 * 1024),
+            {ok, Handle} = IoMod:open(File, CommitDelayUs, Max, MaxBufBytes),
+            {Handle, Conf0}
+    end,
     {Conf, #wal{fd = Fd,
                 max_size = Max,
                 filename = File}}.
@@ -841,8 +856,15 @@ maybe_pre_allocate(Conf, _Fd, _Max0) ->
 
 close_file(undefined) ->
     ok;
-close_file(Fd) ->
-    file:close(Fd).
+close_file(Fd) when is_pid(Fd) orelse is_reference(Fd) ->
+    file:close(Fd);
+close_file(Handle) ->
+    %% NIF ResourceArc handle
+    try ferricstore_wal_nif:close(Handle) of
+        _ -> ok
+    catch _:_ ->
+        ok
+    end.
 
 start_batch(#state{conf = #conf{counter = CRef}} = State) ->
     ok = counters:add(CRef, ?C_BATCHES, 1),
@@ -1328,4 +1350,19 @@ wal_write(undefined, Fd, Data) ->
     file:write(Fd, Data);
 wal_write(IoMod, Handle, Data) ->
     IoMod:write(Handle, Data).
+
+%% Blocking sync for drain_pending_sync (called during rollover/shutdown).
+%% With NIF: uses sync + wait (blocking). Without NIF: file:datasync.
+wal_sync_blocking(undefined, Fd, SyncMeth) ->
+    sync(Fd, SyncMeth);
+wal_sync_blocking(IoMod, Handle, _SyncMeth) ->
+    %% NIF sync is async — send and wait for completion.
+    Ref = make_ref(),
+    ok = IoMod:sync(Handle, self(), Ref),
+    receive
+        {wal_sync_complete, Ref} -> ok;
+        {wal_sync_error, Ref, Reason} -> throw({stop, {wal_sync_failed, Reason}})
+    after 30000 ->
+        throw({stop, wal_sync_timeout})
+    end.
 
