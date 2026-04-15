@@ -436,7 +436,10 @@ commit_tx(#?MODULE{cfg = #cfg{uid = UId,
     PrevIdx = previous_wal_index(State),
     {WalCommands, Num, _} =
         lists:foldl(fun ({Idx, Term, Cmd0}, {WC, N, Prev}) ->
-                            Cmd = {ttb, term_to_iovec(Cmd0)},
+                            Cmd = case Cmd0 of
+                                {ttb, _} -> Cmd0;
+                                _ -> {ttb, term_to_iovec(Cmd0)}
+                            end,
                             WalC = {append, WriterId, Tid, Prev, Idx, Term, Cmd},
                             {[WalC | WC], N+1, Idx}
                     end, {[], 0, PrevIdx}, Entries),
@@ -484,7 +487,10 @@ append({Idx, Term, Cmd0} = Entry,
       when ?IS_NEXT_IDX(Idx, Range) ->
     case ra_mt:insert(Entry, Mt0) of
         {ok, Mt} ->
-            Cmd = {ttb, term_to_iovec(Cmd0)},
+            Cmd = case Cmd0 of
+                                {ttb, _} -> Cmd0;
+                                _ -> {ttb, term_to_iovec(Cmd0)}
+                            end,
             case ra_log_wal:write(Wal, {UId, self()}, ra_mt:tid(Mt),
                                   previous_wal_index(State),
                                   Idx, Term, Cmd) of
@@ -1557,7 +1563,10 @@ wal_write_batch(#?MODULE{cfg = #cfg{uid = UId,
     Tid = ra_mt:tid(Mt0),
     {WalCommands, Num, LastIdx, Pend} =
         lists:foldl(fun ({Idx, Term, Cmd0}, {WC, N, Prev, P}) ->
-                            Cmd = {ttb, term_to_iovec(Cmd0)},
+                            Cmd = case Cmd0 of
+                                {ttb, _} -> Cmd0;
+                                _ -> {ttb, term_to_iovec(Cmd0)}
+                            end,
                             WalC = {append, WriterId, Tid, Prev, Idx, Term, Cmd},
                             {[WalC | WC], N+1, Idx, ra_seq:append(Idx, P)}
                     end, {[], 0, PrevIdx, Pend0}, Entries),
