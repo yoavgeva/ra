@@ -82,6 +82,13 @@ make_wal_conf(#{data_dir := DataDir,
     MinBinVheapSize = maps:get(wal_min_bin_vheap_size, Cfg,
                                ?MIN_BIN_VHEAP_SIZE),
     MinHeapSize = maps:get(wal_min_heap_size, Cfg, ?MIN_HEAP_SIZE),
+    %% Forward the NIF-backed I/O config through so ra_log_wal:init/1 can
+    %% pick it up. Without this the WAL falls back to file:write/2 which
+    %% dispatches via :prim_file to the dirty scheduler pool — that's what
+    %% made ra_log_wal burn 800K reductions/sec on an idle server.
+    WalIoModule = maps:get(wal_io_module, Cfg, undefined),
+    WalCommitDelayUs = maps:get(wal_commit_delay_us, Cfg, 200),
+    WalMaxBufferBytes = maps:get(wal_max_buffer_bytes, Cfg, 64 * 1024 * 1024),
     #{names => Names,
       system => System,
       dir => WalDir,
@@ -94,5 +101,8 @@ make_wal_conf(#{data_dir := DataDir,
       garbage_collect => Gc,
       pre_allocate => PreAlloc,
       min_heap_size => MinHeapSize,
-      min_bin_vheap_size => MinBinVheapSize
+      min_bin_vheap_size => MinBinVheapSize,
+      wal_io_module => WalIoModule,
+      wal_commit_delay_us => WalCommitDelayUs,
+      wal_max_buffer_bytes => WalMaxBufferBytes
      }.
