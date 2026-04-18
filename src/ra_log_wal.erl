@@ -96,7 +96,10 @@
                %% Optional NIF-backed I/O module. When set, replaces file:write,
                %% fdatasync, open, close with NIF calls for higher throughput.
                %% The module must export: open/4, write/2, sync/3, close/1, position/1
-               wal_io_module :: atom() | undefined
+               wal_io_module :: atom() | undefined,
+               %% NIF-backed WAL tunables — passed to IoMod:open/4.
+               wal_commit_delay_us = 200 :: non_neg_integer(),
+               wal_max_buffer_bytes = 67108864 :: non_neg_integer()
               }).
 
 -record(wal, {fd :: option(file:io_device()),
@@ -325,6 +328,8 @@ init(#{system := System,
                            ?COUNTER_FIELDS,
                            #{ra_system => System, module => ?MODULE}),
     WalIoModule = maps:get(wal_io_module, Conf0, undefined),
+    WalCommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 200),
+    WalMaxBufferBytes = maps:get(wal_max_buffer_bytes, Conf0, 64 * 1024 * 1024),
     Conf = #conf{dir = Dir,
                  system = System,
                  segment_writer = SegWriter,
@@ -339,7 +344,9 @@ init(#{system := System,
                  explicit_gc = Gc,
                  pre_allocate = PreAllocate,
                  ra_log_snapshot_state_tid = ets:whereis(ra_log_snapshot_state),
-                 wal_io_module = WalIoModule},
+                 wal_io_module = WalIoModule,
+                 wal_commit_delay_us = WalCommitDelayUs,
+                 wal_max_buffer_bytes = WalMaxBufferBytes},
     try recover_wal(Dir, Conf) of
         Result ->
             % wait for the segment writer to process any flush requests
@@ -766,7 +773,9 @@ roll_over(#state{wal = Wal0, file_num = Num0,
                  wal = Wal,
                  file_num = Num}.
 
-open_wal(File, Max, #conf{wal_io_module = IoMod} = Conf0) ->
+open_wal(File, Max, #conf{wal_io_module = IoMod,
+                          wal_commit_delay_us = CommitDelayUs,
+                          wal_max_buffer_bytes = MaxBufBytes} = Conf0) ->
     {Fd, Conf} = case IoMod of
         undefined ->
             {ok, Fd0} = prepare_file(File, ?FILE_MODES),
@@ -776,8 +785,6 @@ open_wal(File, Max, #conf{wal_io_module = IoMod} = Conf0) ->
             %% make_tmp writes the header first, then we rename
             Tmp = make_tmp(File),
             ok = prim_file:rename(Tmp, File),
-            CommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 200),
-            MaxBufBytes = maps:get(wal_max_buffer_bytes, Conf0, 64 * 1024 * 1024),
             {ok, Handle} = IoMod:open(File, CommitDelayUs, Max, MaxBufBytes),
             %% Store handle for stats access from outside
             persistent_term:put(ferricstore_wal_handle, Handle),
@@ -990,7 +997,14 @@ open_at_first_record(File) ->
             %% the only version currently supported
             Fd;
         {ok, <<Magic:4/binary, UnknownVersion:8/unsigned>>} ->
-            exit({unknown_wal_file_format, Magic, UnknownVersion})
+            exit({unknown_wal_file_format, Magic, UnknownVersion});
+        eof ->
+            %% Empty or pre-allocated WAL file (e.g. NIF WAL with fallocate
+            %% that crashed before writing the header). Nothing to recover.
+            Fd;
+        {ok, <<0, 0, 0, 0, _/binary>>} ->
+            %% Pre-allocated file filled with zeros. Nothing to recover.
+            Fd
     end.
 
 close_existing(Fd) ->
