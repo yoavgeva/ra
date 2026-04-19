@@ -785,7 +785,13 @@ open_wal(File, Max, #conf{wal_io_module = IoMod,
             %% make_tmp writes the header first, then we rename
             Tmp = make_tmp(File),
             ok = prim_file:rename(Tmp, File),
-            {ok, Handle} = IoMod:open(File, CommitDelayUs, Max, MaxBufBytes),
+            %% ra uses charlist filenames internally; the NIF's rustler
+            %% binding requires a binary. Convert once at the boundary.
+            FileBin = case File of
+                          L when is_list(L) -> list_to_binary(L);
+                          B when is_binary(B) -> B
+                      end,
+            {ok, Handle} = IoMod:open(FileBin, CommitDelayUs, Max, MaxBufBytes),
             %% Store handle for stats access from outside
             persistent_term:put(ferricstore_wal_handle, Handle),
             {Handle, Conf0}
