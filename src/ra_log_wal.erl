@@ -1002,14 +1002,14 @@ open_at_first_record(File) ->
         {ok, <<?MAGIC, ?CURRENT_VERSION:8/unsigned>>} ->
             %% the only version currently supported
             Fd;
+        {ok, <<0, 0, 0, 0, _/binary>>} ->
+            %% Pre-allocated file filled with zeros. Nothing to recover.
+            Fd;
         {ok, <<Magic:4/binary, UnknownVersion:8/unsigned>>} ->
             exit({unknown_wal_file_format, Magic, UnknownVersion});
         eof ->
             %% Empty or pre-allocated WAL file (e.g. NIF WAL with fallocate
             %% that crashed before writing the header). Nothing to recover.
-            Fd;
-        {ok, <<0, 0, 0, 0, _/binary>>} ->
-            %% Pre-allocated file filled with zeros. Nothing to recover.
             Fd
     end.
 
