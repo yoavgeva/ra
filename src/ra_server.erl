@@ -3466,7 +3466,7 @@ append_log_leader({'$ra_join', From, #{id := JoiningNode,
                   #{cluster := OldCluster} = State, Effects) ->
     case ensure_promotion_target(Voter0, State) of
         {error, Reason} ->
-            {not_appended, Reason, State};
+            {not_appended, Reason, State, Effects};
         {ok, Voter} ->
             case OldCluster of
                 #{JoiningNode := #{voter_status := Voter}} ->
