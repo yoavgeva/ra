@@ -791,10 +791,17 @@ open_wal(File, Max, #conf{wal_io_module = IoMod,
                           L when is_list(L) -> list_to_binary(L);
                           B when is_binary(B) -> B
                       end,
-            {ok, Handle} = IoMod:open(FileBin, CommitDelayUs, Max, MaxBufBytes),
-            %% Store handle for stats access from outside
-            persistent_term:put(ferricstore_wal_handle, Handle),
-            {Handle, Conf0}
+            OpenResult = IoMod:open(FileBin, CommitDelayUs, Max, MaxBufBytes),
+            case OpenResult of
+                {ok, Handle} ->
+                    %% Store handle for stats access from outside
+                    persistent_term:put(ferricstore_wal_handle, Handle),
+                    {Handle, Conf0};
+                {error, Reason} ->
+                    ?ERROR("WAL NIF open failed: path=~ts delay=~b max=~b buf=~b reason=~p",
+                           [FileBin, CommitDelayUs, Max, MaxBufBytes, Reason]),
+                    error({wal_nif_open_failed, Reason})
+            end
     end,
     {Conf, #wal{fd = Fd,
                 max_size = Max,
