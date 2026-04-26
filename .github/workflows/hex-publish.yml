@@ -1,0 +1,26 @@
+name: Publish to Hex.pm
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    name: Publish ra_ferricstore to Hex.pm
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Publish to Hex
+        run: rebar3 hex publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
