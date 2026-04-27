@@ -878,10 +878,15 @@ maybe_pre_allocate(Conf, _Fd, _Max0) ->
 
 close_file(undefined) ->
     ok;
-close_file(Fd) when is_pid(Fd) orelse is_reference(Fd) ->
-    file:close(Fd);
-close_file(Handle) ->
-    %% NIF ResourceArc handle
+close_file(Fd) when is_pid(Fd); is_tuple(Fd) ->
+    %% Standard file: io_device is pid() | #file_descriptor{} (a tuple).
+    %% NEVER add is_reference/1 here — NIF ResourceArc handles are
+    %% references and would be misrouted to file:close, which returns
+    %% {error, badarg} for them. That crashes the WAL gen_server.
+    _ = file:close(Fd),
+    ok;
+close_file(Handle) when is_reference(Handle) ->
+    %% NIF ResourceArc handle (Rust-side WAL).
     try ferricstore_wal_nif:close(Handle) of
         _ -> ok
     catch _:_ ->
